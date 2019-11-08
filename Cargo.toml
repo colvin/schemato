@@ -1,0 +1,13 @@
+[package]
+name = "schemato"
+version = "0.1.0"
+authors = ["colvin <39858617+colvin@users.noreply.github.com>"]
+edition = "2018"
+
+[dependencies]
+clap = "2.33.0"
+log = "0.4"
+fern = "0.5"
+chrono = "0.4"
+postgres = "0.15"
+glob = "0.3"

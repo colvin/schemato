@@ -1,3 +1,3 @@
 # schemato
 
-Schemata migration manager for applications using a PostgreSQL databases.
+Schemata migration manager for applications using a PostgreSQL database.
