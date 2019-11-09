@@ -12,6 +12,8 @@ use postgres::{Connection, TlsMode};
 
 use glob::glob;
 
+const LOCK_ID: i64 = 10297114116;
+
 fn main() {
     let matches = App::new("schemato")
         .version(env!("CARGO_PKG_VERSION"))
@@ -170,6 +172,11 @@ fn main() {
             std::process::exit(1);
         });
 
+    info!("locking");
+    anon_conn
+        .execute("SELECT pg_advisory_lock($1)", &[&LOCK_ID])
+        .unwrap();
+
     let query_for_database = r#"
         SELECT COUNT(*) AS c
         FROM pg_catalog.pg_database
@@ -205,6 +212,10 @@ fn main() {
             error!("unable to connect");
             std::process::exit(1);
         });
+
+    info!("locking");
+    conn.execute("SELECT pg_advisory_lock($1)", &[&LOCK_ID])
+        .unwrap();
 
     let query_for_version_schema = r#"
         SELECT 1 AS has_schema
