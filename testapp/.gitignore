@@ -1,0 +1,4 @@
+bin/
+.crates.toml
+*.env
+.dep.*
