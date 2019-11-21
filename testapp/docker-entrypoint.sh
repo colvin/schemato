@@ -1,8 +1,6 @@
 #!/bin/sh
 set -e
 
-echo "PWD: $( pwd )"
-
 # Inject runtime state such as passwords into the static files.
 test -n "$POSTGREST_PASSWORD" || { echo "testapp: missing POSTGREST_PASSWORD" ; exit 1 ; }
 test -n "$POSTGREST_JWT_SECRET" || { echo "testapp: missing POSTGREST_JWT_SECRET" ; exit 1 ; }
