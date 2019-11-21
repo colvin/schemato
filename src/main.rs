@@ -14,14 +14,35 @@ use glob::glob;
 
 const LOCK_ID: i64 = 10297114116;
 
+struct SchematoConfig<'a> {
+    db_name: &'a str,
+    db_host: &'a str,
+    db_port: u16,
+    db_user: &'a str,
+    db_pass: Option<&'a str>,
+    prefix: &'a str,
+    attempts: u32,
+    backoff: u64,
+    force: bool,
+}
+
+impl<'a> SchematoConfig<'a> {
+    fn uri_safe(&self) -> String {
+        return format!(
+            "postgres://{}@{}:{}",
+            self.db_user, self.db_host, self.db_port
+        );
+    }
+}
+
 fn main() {
     let matches = App::new("schemato")
         .version(env!("CARGO_PKG_VERSION"))
-        .author("colvin")
-        .about("Container-oriented database schemata management")
+        .author("github.com/colvin")
+        .about("database migration management for postgres-backed applications")
         .arg(
             Arg::with_name("database")
-                .value_name("DATABASE")
+                .value_name("SCHEMATO_DATABASE")
                 .required(true)
                 .help("Database name on which to operate"),
         )
@@ -29,50 +50,50 @@ fn main() {
             Arg::with_name("schemata")
                 .short("s")
                 .long("schemata")
-                .env("SCHEMATA")
+                .env("SCHEMATO_SCHEMATA")
                 .takes_value(true)
                 .value_name("PATH")
                 .default_value(".")
-                .help("Path to schemata directory"),
+                .help("Path to a directory containing SQL files"),
         )
         .arg(
             Arg::with_name("host")
                 .short("h")
                 .long("host")
-                .env("DATABASE_HOST")
+                .env("SCHEMATO_DATABASE_HOST")
                 .takes_value(true)
-                .value_name("ADDRESS")
+                .value_name("HOSTNAME")
                 .default_value("localhost")
-                .help("Database host address"),
+                .help("PostgreSQL server hostname"),
         )
         .arg(
             Arg::with_name("port")
                 .short("p")
                 .long("port")
-                .env("DATABASE_PORT")
+                .env("SCHEMATO_DATABASE_PORT")
                 .takes_value(true)
                 .value_name("PORT")
                 .default_value("5432")
-                .help("Database port"),
+                .help("PostgreSQL server TCP port"),
         )
         .arg(
             Arg::with_name("username")
                 .short("u")
                 .long("username")
-                .env("DATABASE_USER")
+                .env("SCHEMATO_DATABASE_USER")
                 .takes_value(true)
                 .value_name("USER")
                 .default_value("postgres")
-                .help("Authentication username"),
+                .help("Superuser username"),
         )
         .arg(
             Arg::with_name("password")
                 .short("P")
                 .long("password")
-                .env("DATABASE_PASS")
+                .env("SCHEMATO_DATABASE_PASS")
                 .takes_value(true)
                 .value_name("PASSWORD")
-                .help("Authentication password"),
+                .help("Superuser password"),
         )
         .arg(
             Arg::with_name("attempts")
@@ -97,7 +118,7 @@ fn main() {
         .arg(
             Arg::with_name("force")
                 .long("force")
-                .help("Attempt to continue through errors"),
+                .help("Attempt to continue through some errors"),
         )
         .arg(
             Arg::with_name("quiet")
@@ -124,21 +145,33 @@ fn main() {
 
     setup_logger(log_level).unwrap();
 
-    let db_name = matches.value_of("database").unwrap();
-    let db_host = matches.value_of("host").unwrap();
-    let db_port = must_parse_u16_arg(matches.value_of("port").unwrap(), "port");
-    let db_user = matches.value_of("username").unwrap();
-    let db_pass = matches.value_of("password");
+    let cfg = SchematoConfig {
+        db_name: matches.value_of("database").unwrap(),
+        db_host: matches.value_of("host").unwrap(),
+        db_port: matches
+            .value_of("port")
+            .unwrap()
+            .parse::<u16>()
+            .unwrap_or_else(|e| exit_logging_error(&format!("Bad value for port: {}", e))),
+        db_user: matches.value_of("username").unwrap(),
+        db_pass: matches.value_of("password"),
+        prefix: matches.value_of("schemata").unwrap(),
+        attempts: matches
+            .value_of("attempts")
+            .unwrap()
+            .parse::<u32>()
+            .unwrap_or_else(|e| exit_logging_error(&format!("Bad value for attempts: {}", e))),
+        backoff: matches
+            .value_of("backoff")
+            .unwrap()
+            .parse::<u64>()
+            .unwrap_or_else(|e| exit_logging_error(&format!("Bad value for backoff: {}", e))),
+        force: matches.is_present("force"),
+    };
 
-    let attempts = must_parse_u32_arg(matches.value_of("attempts").unwrap(), "attempts");
-    let backoff = must_parse_u64_arg(matches.value_of("backoff").unwrap(), "backoff");
-
-    let force = matches.is_present("force");
-
-    let prefix = matches.value_of("schemata").unwrap();
     let mut schemata: Vec<(i32, String)> = Vec::new();
-    info!("loading schemata from {}", prefix);
-    for g in glob(&format!("{}/[0-9][0-9][0-9][0-9].sql", prefix)).unwrap() {
+    info!("loading schemata from {}", cfg.prefix);
+    for g in glob(&format!("{}/[0-9][0-9][0-9][0-9].sql", cfg.prefix)).unwrap() {
         match g {
             Ok(ent) => {
                 let f = ent.file_name().unwrap().to_str().unwrap().to_string();
@@ -160,19 +193,16 @@ fn main() {
         info!("found version {} in {}", s.0, s.1);
     }
 
-    info!("connecting to {}@{}:{}", db_user, db_host, db_port,);
-    debug!(
+    info!("connecting to {}", cfg.uri_safe());
+    info!(
         "making {} attempts with a backoff of {}s",
-        attempts, backoff
+        cfg.attempts, cfg.backoff
     );
 
-    let anon_conn = connect_loop(db_host, db_port, db_user, db_pass, "", attempts, backoff)
-        .unwrap_or_else(|| {
-            error!("unable to connnect");
-            std::process::exit(1);
-        });
+    let anon_conn =
+        connect_loop(&cfg, true).unwrap_or_else(|| exit_logging_error("unable to connect"));
 
-    info!("locking");
+    info!("obtaining lock");
     anon_conn
         .execute("SELECT pg_advisory_lock($1)", &[&LOCK_ID])
         .unwrap();
@@ -183,37 +213,38 @@ fn main() {
         WHERE datname = $1
     "#;
 
-    match anon_conn.query(query_for_database, &[&db_name]) {
+    match anon_conn.query(query_for_database, &[&cfg.db_name]) {
         Ok(rows) => {
             let c: i64 = rows.get(0).get("c");
             match c {
                 0 => {
-                    create_database(&anon_conn, db_name);
+                    create_database(&anon_conn, cfg.db_name);
                 }
                 1 => {
-                    info!("database {} exists", db_name);
+                    info!("database {} exists", cfg.db_name);
                 }
                 _ => {
-                    exit_logging_error(&format!("database {} appears {} times?", db_name, c));
+                    exit_logging_error(&format!("database {} appears {} times?", cfg.db_name, c));
                 }
             }
         }
         Err(e) => {
             exit_logging_error(&format!(
                 "failed to determine existence of database {}: {}",
-                db_name, e
+                cfg.db_name, e
             ));
         }
     }
 
-    info!("reconnecting to the {} database", db_name);
-    let conn = connect_loop(db_host, db_port, db_user, db_pass, db_name, 1, backoff)
-        .unwrap_or_else(|| {
-            error!("unable to connect");
-            std::process::exit(1);
-        });
+    anon_conn.finish().unwrap();
 
-    info!("locking");
+    info!("reconnecting to the {} database", cfg.db_name);
+    let conn = connect_loop(&cfg, false).unwrap_or_else(|| {
+        error!("unable to connect");
+        std::process::exit(1);
+    });
+
+    info!("obtaining lock");
     conn.execute("SELECT pg_advisory_lock($1)", &[&LOCK_ID])
         .unwrap();
 
@@ -224,16 +255,16 @@ fn main() {
         AND schema_name = $2
     "#;
 
-    match conn.query(query_for_version_schema, &[&db_name, &"schemato"]) {
+    match conn.query(query_for_version_schema, &[&cfg.db_name, &"schemato"]) {
         Ok(rows) => {
             if rows.len() < 1 {
-                create_schema(&conn, db_name);
+                create_schema(&conn, cfg.db_name);
             }
         }
         Err(e) => {
             exit_logging_error(&format!(
                 "failed to determine existence of {}.schemato: {}",
-                db_name, e
+                cfg.db_name, e
             ));
         }
     }
@@ -263,7 +294,7 @@ fn main() {
         if installed.contains_key(&ver.0) {
             info!("installed: {}", ver.0);
         } else {
-            apply(&conn, ver.0, prefix, &ver.1, force);
+            apply(&conn, ver.0, &ver.1, &cfg);
         }
     }
 
@@ -274,39 +305,6 @@ fn main() {
 fn exit_logging_error(err: &str) -> ! {
     error!("{}", err);
     std::process::exit(1);
-}
-
-fn must_parse_u16_arg(arg: &str, val: &str) -> u16 {
-    match arg.parse::<u16>() {
-        Ok(v) => {
-            return v;
-        }
-        Err(e) => {
-            exit_logging_error(&format!("bad value for {}: {}", val, e));
-        }
-    }
-}
-
-fn must_parse_u32_arg(arg: &str, val: &str) -> u32 {
-    match arg.parse::<u32>() {
-        Ok(v) => {
-            return v;
-        }
-        Err(e) => {
-            exit_logging_error(&format!("bad value for {}: {}", val, e));
-        }
-    }
-}
-
-fn must_parse_u64_arg(arg: &str, val: &str) -> u64 {
-    match arg.parse::<u64>() {
-        Ok(v) => {
-            return v;
-        }
-        Err(e) => {
-            exit_logging_error(&format!("bad value for {}: {}", val, e));
-        }
-    }
 }
 
 fn setup_logger(lvl: log::LevelFilter) -> Result<(), fern::InitError> {
@@ -326,25 +324,17 @@ fn setup_logger(lvl: log::LevelFilter) -> Result<(), fern::InitError> {
     Ok(())
 }
 
-fn connect_loop(
-    host: &str,
-    port: u16,
-    user: &str,
-    pass: Option<&str>,
-    db: &str,
-    attempts: u32,
-    backoff: u64,
-) -> Option<Connection> {
-    for attempt in 1..attempts + 1 {
-        match connect_postgres(host, port, user, pass, db) {
+fn connect_loop(cfg: &SchematoConfig, anon: bool) -> Option<Connection> {
+    for attempt in 1..cfg.attempts + 1 {
+        match connect_postgres(cfg, anon) {
             Ok(c) => {
                 info!("connected on attempt {}", attempt);
                 return Some(c);
             }
             Err(e) => {
                 warn!("failed connection on attempt {}: {}", attempt, e);
-                if attempt != attempts {
-                    std::thread::sleep(std::time::Duration::from_secs(backoff));
+                if attempt != cfg.attempts {
+                    std::thread::sleep(std::time::Duration::from_secs(cfg.backoff));
                 }
             }
         }
@@ -352,18 +342,12 @@ fn connect_loop(
     None
 }
 
-fn connect_postgres(
-    host: &str,
-    port: u16,
-    user: &str,
-    pass: Option<&str>,
-    db: &str,
-) -> Result<Connection, postgres::Error> {
+fn connect_postgres(cfg: &SchematoConfig, anon: bool) -> Result<Connection, postgres::Error> {
     let params = ConnectParams::builder()
-        .user(user, pass)
-        .port(port)
-        .database(db)
-        .build(Host::Tcp(host.to_string()));
+        .user(cfg.db_user, cfg.db_pass)
+        .port(cfg.db_port)
+        .database(if anon { "" } else { cfg.db_name })
+        .build(Host::Tcp(cfg.db_host.to_string()));
     let conn = Connection::connect(params, TlsMode::None)?;
     Ok(conn)
 }
@@ -383,21 +367,8 @@ fn create_schema(conn: &Connection, db_name: &str) {
 
         CREATE TABLE schemato.versions (
             version INTEGER NOT NULL PRIMARY KEY,
-            tstamp  TIMESTAMP WITH TIME ZONE NOT NULL
+            tstamp  TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
         );
-
-        CREATE OR REPLACE FUNCTION schemato.set_tstamp()
-        RETURNS TRIGGER AS $$
-        BEGIN
-            NEW.tstamp = NOW();
-            RETURN NEW;
-        END;
-        $$ LANGUAGE plpgsql;
-
-        CREATE TRIGGER schemato_versions_tstamp
-        BEFORE INSERT ON schemato.versions
-        FOR EACH ROW
-        EXECUTE PROCEDURE schemato.set_tstamp();
 
         INSERT INTO schemato.versions (version) VALUES (0);
     "#;
@@ -410,18 +381,18 @@ fn create_schema(conn: &Connection, db_name: &str) {
     t.commit().unwrap();
 }
 
-fn apply(conn: &Connection, ver: i32, prefix: &str, path: &str, force: bool) {
+fn apply(conn: &Connection, ver: i32, path: &str, cfg: &SchematoConfig) {
     info!("applying version {} from {}", ver, path);
-    let d = std::fs::read_to_string(format!("{}/{}", prefix, path));
+    let d = std::fs::read_to_string(format!("{}/{}", cfg.prefix, path));
     if let Err(e) = d {
-        if force {
+        if cfg.force {
             warn!(
                 "skipping version {} due to error reading {}/{}: {}",
-                ver, prefix, path, e
+                ver, cfg.prefix, path, e
             );
             return;
         } else {
-            exit_logging_error(&format!("failed reading {}/{}: {}", prefix, path, e));
+            exit_logging_error(&format!("failed reading {}/{}: {}", cfg.prefix, path, e));
         }
     }
     let set_version = r#"
@@ -438,7 +409,7 @@ fn apply(conn: &Connection, ver: i32, prefix: &str, path: &str, force: bool) {
             }
         }
         Err(e) => {
-            if force {
+            if cfg.force {
                 warn!("continuing through error applying version {}: {}", ver, e);
                 t.set_rollback();
                 return;
